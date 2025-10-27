@@ -236,4 +236,77 @@ class AttendanceController extends Controller
         // Return the file as a download
         return response()->stream($callback, 200, $headers);
     }
+    /**
+     * Show the page for editing attendance for a specific past date.
+     */
+    public function edit(Request $request)
+    {
+        $batches = Batch::orderBy('name')->get();
+
+        // Get selected date and batch, defaulting to today and the first batch
+        $selectedDate = $request->input('date', Carbon::today()->toDateString());
+        $defaultBatchId = $batches->first()->id ?? null;
+        $selectedBatchId = $request->input('batch_filter', $defaultBatchId);
+
+        // Get students for the selected batch
+        $students = Student::where('batch_id', $selectedBatchId)->orderBy('name')->get();
+
+        // Get existing attendance records for these students ON THE SELECTED DATE
+        $existingAttendance = Attendance::where('date', $selectedDate) // Use selectedDate
+            ->whereIn('student_id', $students->pluck('id'))
+            ->get()
+            ->keyBy('student_id');
+
+        // Combine student info with their attendance status for the selected date
+        $attendanceList = $students->map(function ($student) use ($existingAttendance) {
+            return [
+                'id' => $student->id,
+                'name' => $student->name,
+                'roll_no' => $student->roll_no,
+                'status' => $existingAttendance[$student->id]->status ?? null, // Status for the selected date
+            ];
+        });
+
+        return view('attendance.edit', [
+            'attendanceList' => $attendanceList,
+            'batches' => $batches,
+            'selectedBatchId' => $selectedBatchId,
+            'selectedDate' => $selectedDate, // Pass selected date to view
+            'selectedDateFormatted' => Carbon::parse($selectedDate)->format('D, M j, Y'), // Formatted date for display
+        ]);
+    }
+
+    /**
+     * Update attendance records for a specific past date.
+     */
+    public function updatePast(Request $request)
+    {
+        $validated = $request->validate([
+            'attendance' => 'required|array',
+            'attendance.*' => 'required|in:present,absent',
+            'date' => 'required|date', // The date being edited
+            'batch_filter' => 'required|exists:batches,id', // Keep track of the batch
+        ]);
+
+        $editDate = Carbon::parse($validated['date'])->toDateString();
+
+        foreach ($validated['attendance'] as $studentId => $status) {
+            Attendance::updateOrCreate(
+                [
+                    'student_id' => $studentId,
+                    'date' => $editDate, // Use the specific date from the form
+                ],
+                [
+                    'status' => $status
+                ]
+            );
+        }
+
+        // Redirect back to the edit page for the SAME date and batch
+        return redirect()->route('attendance.edit', [
+                            'date' => $validated['date'],
+                            'batch_filter' => $validated['batch_filter']
+                        ])
+                         ->with('success', 'Attendance for ' . Carbon::parse($editDate)->format('M j, Y') . ' updated successfully!');
+    }
 }

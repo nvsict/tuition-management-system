@@ -11,6 +11,7 @@ class Student extends Model
 
     protected $fillable = [
         'name',
+        'profile_picture_url',
         'roll_no',
         'class',
         'phone',

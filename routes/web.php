@@ -34,3 +34,11 @@ Route::post('/settings', [SettingsController::class, 'update'])->name('settings.
 
 // Add this line for the reminder list page
 Route::get('/fees/reminders', [TransactionController::class, 'reminders'])->name('fees.reminders');
+Route::put('/fees/{transaction}', [TransactionController::class, 'update'])->name('fees.update');
+
+// Routes for editing past attendance
+Route::get('/attendance/edit', [AttendanceController::class, 'edit'])->name('attendance.edit');
+Route::post('/attendance/update', [AttendanceController::class, 'updatePast'])->name('attendance.updatePast');
+
+// Add this line for the student profile page
+Route::get('/students/{student}/profile', [StudentController::class, 'profile'])->name('students.profile');

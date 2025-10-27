@@ -6,52 +6,62 @@ use App\Models\Transaction;
 use App\Models\Student;
 use Illuminate\Http\Request;
 use Carbon\Carbon;
+use Illuminate\Support\Facades\DB;
 
 class TransactionController extends Controller
 {
     /**
      * Display the main fee ledger page.
-     * This page will show a student's balance and transaction history.
      */
     public function index(Request $request)
     {
-        $students = Student::orderBy('name')->get();
-        $selectedStudent = null;
-        $transactions = [];
-        $currentBalance = 0;
-
-        // Check if a specific student is being viewed
-        if ($request->has('student_id')) {
-            $selectedStudent = Student::find($request->student_id);
-
-            if ($selectedStudent) {
-                // This is the magic! Auto-create any missed fee charges
-                // before we display the ledger.
-                $this->autoGenerateCharges($selectedStudent);
-
-                // Now, fetch all transactions for this student
-                $transactions = $selectedStudent->transactions()->get();
-                
-                // Calculate their true balance
-                $currentBalance = $transactions->sum('amount');
-            }
+        // 1. Master Student List for Dropdown (Always Needed)
+        $masterStudentList = Student::orderBy('name')->with('batch')->get();
+        
+        // 2. Force Charge Generation (Ensures Balances are Accurate)
+        // Still run this before loading any student's ledger
+        foreach ($masterStudentList as $student) {
+            $this->autoGenerateCharges($student);
         }
 
-        // Calculate total due from all students
+        // 3. Determine Selected Student (Simpler logic)
+        $selectedStudent = null;
+        if ($request->has('student_id')) {
+            $selectedStudent = Student::find($request->student_id);
+        }
+
+        // 4. Final Ledger Setup (Fetch balance if student selected)
+        $transactions = collect();
+        $currentBalance = 0;
+        if ($selectedStudent) {
+            // Fetch balance directly for the selected student after charges generated
+             $selectedStudentData = DB::table('students')
+                ->selectRaw('SUM(COALESCE(transactions.amount, 0)) as total_due_amount')
+                ->leftJoin('transactions', 'students.id', '=', 'transactions.student_id')
+                ->where('students.id', '=', $selectedStudent->id)
+                ->groupBy('students.id')
+                ->first();
+            $currentBalance = $selectedStudentData->total_due_amount ?? 0;
+            $transactions = $selectedStudent->transactions()->get();
+            // Attach the balance for view consistency
+            $selectedStudent->transactions_sum_amount = $currentBalance; 
+        }
+
+        // 5. Calculate total due (Overall stat for the top card)
         $totalDue = $this->calculateTotalDue();
 
         return view('transactions.index', compact(
-            'students',
+            'masterStudentList', 
             'selectedStudent',
             'transactions',
             'currentBalance',
             'totalDue'
+            // 'isDueSoonFilter' and 'dueSoonStudents' are removed
         ));
     }
-
+    
     /**
      * Store a new PAYMENT transaction.
-     * This form is for receiving money from the student.
      */
     public function store(Request $request)
     {
@@ -69,9 +79,35 @@ class TransactionController extends Controller
             'date' => $validated['date'],
         ]);
 
-        // Redirect back to the same student's ledger
         return redirect()->route('fees.index', ['student_id' => $validated['student_id']])
                          ->with('success', 'Payment recorded successfully.');
+    }
+
+
+    /**
+     * Update an existing transaction (handles PUT request from the modal).
+     */
+    public function update(Request $request, Transaction $transaction)
+    {
+        $validated = $request->validate([
+            'description' => 'required|string|max:255',
+            'amount' => 'required|numeric|min:0.01', // Absolute value from form
+            'date' => 'required|date',
+        ]);
+        
+        $newAmount = $validated['amount'];
+        if ($transaction->amount < 0) { // Keep the sign if it was a payment
+            $newAmount = -$newAmount;
+        }
+        
+        $transaction->update([
+            'description' => $validated['description'],
+            'amount' => $newAmount,
+            'date' => $validated['date'],
+        ]);
+        
+        return redirect()->route('fees.index', ['student_id' => $transaction->student_id])
+                         ->with('success', 'Transaction updated successfully.');
     }
 
     /**
@@ -85,104 +121,97 @@ class TransactionController extends Controller
         return redirect()->route('fees.index', ['student_id' => $studentId])
                          ->with('success', 'Transaction deleted successfully.');
     }
+    
+    /**
+     * Display a list of students with outstanding fee balances (Reminder List page).
+     */
+    public function reminders()
+    {
+        // Force charge generation before querying for dues
+        $allStudentsForCharges = Student::whereNotNull('join_date')->get();
+        foreach ($allStudentsForCharges as $student) {
+             $this->autoGenerateCharges($student);
+        }
+        
+        // Now query students with a positive balance
+        $studentsWithDues = Student::with('batch') // Eager load batch for the view
+                                   ->withSum('transactions', 'amount')
+                                   ->having('transactions_sum_amount', '>', 0)
+                                   ->orderBy('name')
+                                   ->get();
+
+        return view('transactions.reminders', compact('studentsWithDues'));
+    }
 
     // =========================================================================
     //  PRIVATE HELPER FUNCTIONS
     // =========================================================================
 
     /**
-     * This is the core logic of the billing system.
-     * It checks a student's join date and last charge, and creates any
-     * missed monthly fee "CHARGES" to bring their account up to date.
+     * Auto-creates any missed monthly fee "CHARGES".
+     * KEPT: Essential for accurate balances.
      */
-    private function autoGenerateCharges(Student $student)
-{
-    $joinDate = $student->join_date;
-    $monthlyFee = $student->fees;
+     private function autoGenerateCharges(Student $student)
+     {
+         $joinDate = $student->join_date;
+         $monthlyFee = $student->fees;
 
-    // Skip if join date is not set or fee is zero
-    if (!$joinDate || $monthlyFee <= 0) {
-        return;
-    }
+         if (!$joinDate || $monthlyFee <= 0) {
+             return;
+         }
 
-    // Find the date of the last CHARGE (invoice)
-    $lastCharge = $student->transactions()
-                          ->where('amount', '>', 0) // 'amount > 0' means it's a CHARGE
-                          ->orderBy('date', 'desc')
-                          ->first();
+         $lastCharge = $student->transactions()
+                               ->where('amount', '>', 0)
+                               ->orderBy('date', 'desc')
+                               ->first();
 
-    // Determine the starting point for checking
-    // If no charges exist, start checking from the join date.
-    // If charges exist, start checking from the date of the last charge.
-    $cursorDate = $lastCharge ? Carbon::parse($lastCharge->date) : Carbon::parse($joinDate);
+         $cursorDate = $lastCharge ? Carbon::parse($lastCharge->date) : Carbon::parse($joinDate);
+         $billingDay = Carbon::parse($joinDate)->day; 
 
-    // Get the "billing day" (e.g., 25th)
-    $billingDay = $joinDate->day;
+         $nextBillingDate = $cursorDate->copy()->day($billingDay);
+         if ($nextBillingDate->lte($cursorDate)) {
+              $nextBillingDate->addMonthNoOverflow();
+         }
+         $nextBillingDate->day(min($billingDay, $nextBillingDate->daysInMonth));
 
-    // Calculate the next theoretical billing date after the cursor date
-    // Create a mutable copy to avoid changing $cursorDate
-    $nextBillingDate = $cursorDate->copy()->day($billingDay); 
-    // If the calculated day is before or the same as the cursor, move to the next month
-    if ($nextBillingDate->lte($cursorDate)) {
-         $nextBillingDate->addMonthNoOverflow(); // Use NoOverflow to handle end-of-month cases
-    }
+         while ($nextBillingDate->isPast() || $nextBillingDate->isToday()) {
+             $periodStartDate = $nextBillingDate->copy()->subMonthNoOverflow();
+             $periodStartDate->day(min($billingDay, $periodStartDate->daysInMonth)); 
+             $periodEndDate = $nextBillingDate->copy()->subDay();
 
-    // Ensure the billing day is respected if months have different lengths
-    $nextBillingDate->day($billingDay); 
+             $chargeExists = $student->transactions()
+                                     ->where('amount', '>', 0)
+                                     ->where('date', '>=', $periodStartDate->toDateString())
+                                     ->where('date', '<', $nextBillingDate->toDateString())
+                                     ->exists();
 
-
-    // Loop from the next billing date until today
-    // This loop "catches up" all missed billing cycles
-    while ($nextBillingDate->isPast() || $nextBillingDate->isToday()) {
-
-        // Define the billing period this charge represents
-        $periodStartDate = $nextBillingDate->copy()->subMonthNoOverflow()->day($billingDay);
-        $periodEndDate = $nextBillingDate->copy()->subDay(); // Day before the current billing date
-
-        // MORE ROBUST CHECK: Does a charge already exist *within* this billing period?
-        $chargeExists = $student->transactions()
-                                ->where('amount', '>', 0)
-                                ->whereBetween('date', [$periodStartDate->toDateString(), $periodEndDate->toDateString()])
-                                ->exists();
-
-        if (!$chargeExists) {
-            // Create the new CHARGE transaction, dated at the START of the billing period
-             Transaction::create([
-                'student_id' => $student->id,
-                'description' => 'Fee for ' . $periodStartDate->format('M d') . ' - ' . $periodEndDate->format('M d, Y'),
-                'amount' => $monthlyFee, // Positive value
-                'date' => $periodStartDate->toDateString(), // Use the period start date
-            ]);
-        }
-
-        // Move to the next month's billing date to check again
-        $nextBillingDate->addMonthNoOverflow()->day($billingDay);
-    }
-}
+             if (!$chargeExists) {
+                  Transaction::create([
+                     'student_id' => $student->id,
+                     'description' => 'Fee for ' . $periodStartDate->format('M d') . ' - ' . $periodEndDate->format('M d, Y'),
+                     'amount' => $monthlyFee,
+                     'date' => $periodStartDate->toDateString(), 
+                 ]);
+             }
+             $nextBillingDate->addMonthNoOverflow();
+             $nextBillingDate->day(min($billingDay, $nextBillingDate->daysInMonth));
+         }
+     }
 
     /**
-     * Calculates the total amount due from all students.
-     * This is an expensive query, so it should be used sparingly.
+     * Calculates the total amount due from all students (Overall stat).
+     * KEPT: Used in index method.
      */
     private function calculateTotalDue()
     {
-        // This sums the 'amount' column for ALL transactions.
-        // Since payments are negative, this gives us the true balance.
+        // Ensure charges are generated before calculating total due across all students
+         $allStudents = Student::whereNotNull('join_date')->get();
+         foreach ($allStudents as $student) {
+             $this->autoGenerateCharges($student);
+         }
+         // Now sum the transactions
         return Transaction::sum('amount');
     }
 
-    /**
- * Display a list of students with outstanding fee balances.
- */
-public function reminders()
-{
-    // Query students, calculate the sum of their transactions,
-    // and filter for those where the sum (balance) is greater than 0.
-    $studentsWithDues = Student::withSum('transactions', 'amount') // This creates 'transactions_sum_amount'
-                               ->having('transactions_sum_amount', '>', 0)
-                               ->orderBy('name')
-                               ->get();
-
-    return view('transactions.reminders', compact('studentsWithDues'));
-}
+    // --- getStudentsDueSoonList() function REMOVED ---
 }
